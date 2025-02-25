@@ -3,6 +3,7 @@ import pstats
 import io
 import importlib.util
 # import ast
+import re
 from line_profiler import LineProfiler
 from memory_profiler import profile
 import json
@@ -253,65 +254,107 @@ class PerformanceAnalyzer:
             "call_chains": call_chains
         }
 
-    def _analyze_line_level(self, module) -> Dict[str, Any]:
+    def _analyze_line_level(self, module=None):
         """
-        Line-by-line performance analysis.
+        Analyze the line-level performance of code.      
+ 
+        Args:
+            module: The loaded Python module object.
+            
+        Returns:
+            dict: A dictionary containing the line-level analysis results in the following format:
+            {
+                "mode": "line",
+                "file": filename,
+                "results": [
+                    {
+                        "line_number": Line number,
+                        "hits": Number of calls,
+                        "total_time": Total execution time,
+                        "per_hit": Average time per call,
+                        "percent_time": Percentage of total time,
+                        "code": Code content,
+                        "function": Function name it belongs to
+                    },
+                    ...
+                ]
+            }
         """
-        # Get all functions from the module
+            
+        # Get all functions in the module
         functions = self._get_functions_from_module()
         
-        # Add a line_profiler decorator to each function
+        # Add the @profile decorator to each function
         for func_name in functions:
             func = getattr(self.target_module, func_name)
-            self.line_profiler.add_function(func)
+            if callable(func):
+                self.line_profiler.add_function(func)
         
-        # Execute all callable functions in the module
-        self.line_profiler.enable_by_count()
-        exec(open(self.file_path).read(), module.__dict__)
-        self.line_profiler.disable_by_count()
-
-        # Parse line-by-line performance data
-        # self.line_profiler.print_stats()
-        stream = io.StringIO()
-        self.line_profiler.print_stats(stream=stream)
-        stats = stream.getvalue()
-
-        # Parse stats and generate JSON-formatted results
+        # If no functions are found, try executing the file's content directly
+        if not functions:
+            # Execute the file's content
+            self.line_profiler.enable()
+            exec(open(self.file_path).read(), self.target_module.__dict__)
+            self.line_profiler.disable()
+        else:
+            # Execute each function
+            self.line_profiler.enable()
+            for func_name in functions:
+                try:
+                    func = getattr(self.target_module, func_name)
+                    if callable(func):
+                        func()
+                except Exception as e:
+                    # Ignore execution errors and continue analyzing other functions
+                    pass
+            self.line_profiler.disable()
+        
+        # Collect analysis results
+        import io
+        output = io.StringIO()
+        self.line_profiler.print_stats(stream=output)
+        
+        # Parse the output results
         results = []
+        lines = output.getvalue().split('\n')
+        
+        # Skip the header information and parse statistical data line by line
         current_function = None
-        for line in stats.splitlines():
-            if line.startswith("File:"):
-                # Parse file path
-                file_path = line.split("File: ")[1].strip()
-            elif line.startswith("Function:"):
-                # Parse function name
+        for line in lines:
+            # Detect function name lines
+            if line.strip().startswith('Function'):
                 current_function = line.split("Function: ")[1].split(" at ")[0].strip()
-            elif line.strip().startswith("Line #"):
-                # Skip the header
                 continue
-            elif line.strip() and current_function:
-                # Parse each line of performance data
+            
+            # Parse statistical data lines
+            if re.match(r'\s+\d+', line):
                 parts = line.strip().split()
                 if len(parts) >= 6:
-                    line_number = int(parts[0])
-                    hits = int(parts[1])
-                    total_time = float(parts[2])
-                    per_hit = float(parts[3])
-                    percent_time = float(parts[4])
-                    code = " ".join(parts[5:])
-                    results.append({
-                        "line_number": line_number,
-                        "hits": hits,
-                        "total_time": total_time,
-                        "per_hit": per_hit,
-                        "percent_time": percent_time,
-                        "code": code,
-                        "function": current_function
-                    })
-
+                    try:
+                        line_num = int(parts[0])
+                        hits = int(parts[1])
+                        time = float(parts[2])
+                        per_hit = float(parts[3])
+                        percent = float(parts[4].strip('%'))
+                        code = ' '.join(parts[5:])
+                        
+                        results.append({
+                            "line_number": line_num,
+                            "hits": hits,
+                            "total_time": time,
+                            "per_hit": per_hit,
+                            "percent_time": percent,
+                            "code": code,
+                            "function": current_function
+                        })
+                    except (ValueError, IndexError):
+                        # Skip lines that cannot be parsed
+                        pass
+        
+        # Return the analysis results
         return {
             "mode": "line",
-            "file": file_path,
+            "file": self.file_path,
             "results": results
         }
 
@@ -320,5 +363,5 @@ class PerformanceAnalyzer:
 if __name__ == "__main__":
     analyzer = PerformanceAnalyzer()
     
-    result = analyzer.analyze_file("example.py", "function")
+    result = analyzer.analyze_file("example.py", "line")
     print(json.dumps(result, indent=4))
