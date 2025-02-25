@@ -3,6 +3,7 @@ import pstats
 import io
 import importlib.util
 # import ast
+import re
 from line_profiler import LineProfiler
 from memory_profiler import profile
 import json
@@ -69,6 +70,22 @@ class PerformanceAnalyzer:
         """
         Function-level performance analysis.
         """
+        def should_include_function(func_name: str) -> bool:
+            """
+            Determines whether this function should be included in the analysis results.
+            """
+            # Filters out the following types of functions:
+            exclusions = [
+                '<built-in',
+                '<method',
+                '<module>',
+                '<listcomp>',
+                '__init__',
+                'decode',
+                '<'  # Filter out all special functions starting with '<'
+            ]
+            return not any(func_name.startswith(exc) for exc in exclusions)
+
         self.profiler.enable()
         exec(open(self.file_path).read(), module.__dict__)
         self.profiler.disable()
@@ -78,13 +95,37 @@ class PerformanceAnalyzer:
         stats = pstats.Stats(self.profiler, stream=stream)
         stats.strip_dirs().sort_stats('cumulative')
 
-        
         results = []
-        for func, (cc, nc, tt, ct, _) in stats.stats.items():
-        # for func, (cc, _, tt, ct, _) in stats.stats.items():
+        call_chains = []
+        
+        # Extract function-level performance data and assign indices
+        function_indices = {}  # Map function names to their indices in results
+        average_time_map = {}   # Map function names to their total time
+        call_count_map = {}   # Map function names to their call count
+        direct_calls = {}     # Map of direct caller-callee relationships
+
+        # First pass: collect basic function information and build direct call relationships
+        for func, (cc, nc, tt, ct, callers) in stats.stats.items():
             _, line_number, function_name = func
-            if line_number == 0 or function_name[0] == '<': continue
-            if function_name == '__init__': break
+            
+            # Add filtering condition
+            if not should_include_function(function_name):
+                continue
+                
+            function_indices[function_name] = len(results)
+            call_count_map[function_name] = nc
+            average_time_map[function_name] = ct / nc if nc > 0 else 0
+            
+            # Record direct caller-callee relationships
+            for caller, caller_stats in callers.items():
+                _, _, caller_name = caller
+                # Add filtering condition
+                if not should_include_function(caller_name):
+                    continue
+                if caller_name not in direct_calls:
+                    direct_calls[caller_name] = set()
+                direct_calls[caller_name].add(function_name)
+            
             results.append({
                 "function": function_name,
                 "calls": nc,
@@ -93,71 +134,227 @@ class PerformanceAnalyzer:
                 "line_number": line_number,
             })
 
+        def print_call_tree(func_name, indent=0, visited=None, chain=None):
+            """
+            Prints the function call tree.
+            """
+            if visited is None:
+                visited = set()
+            if chain is None:
+                chain = []
+                
+            if func_name in visited:
+                print("  " * indent + f"└── {func_name} (recursive call)")
+                return
+                
+            visited.add(func_name)
+            chain.append(func_name)
+            
+            # Print current function
+            prefix = "  " * indent + "└── " if indent > 0 else ""
+            calls = call_count_map.get(func_name, 0)
+            time = average_time_map.get(func_name, 0)
+            print(f"{prefix}{func_name} (calls: {calls}, time: {time:.6f}s)")
+            
+            # Recursively print called functions
+            callees = direct_calls.get(func_name, set())
+            for callee in callees:
+                if callee not in visited and should_include_function(callee):
+                    print_call_tree(callee, indent + 1, visited.copy(), chain.copy())
+                        
+        def build_call_chains(func_name, current_chain=None, visited=None):
+            """
+            Builds the call chains.
+            """
+            if visited is None:
+                visited = set()
+            if current_chain is None:
+                current_chain = []
+                
+            if func_name in visited:
+                return
+                
+            visited.add(func_name)
+            current_chain.append(func_name)
+            
+            # Get directly called functions
+            callees = direct_calls.get(func_name, set())
+            
+            # Create list of indices for current chain's children
+            children_indices = []
+            for callee in callees:
+                if callee in function_indices and should_include_function(callee):
+                    children_indices.append(function_indices[callee])
+            
+            # Calculate self_time
+            self_time = average_time_map[func_name]
+            for callee in callees:
+                if callee in average_time_map and should_include_function(callee):
+                    self_time -= average_time_map[callee]
+            
+            # Add current call chain
+            call_chains.append({
+                "chain": current_chain.copy(),
+                "count": call_count_map[func_name],
+                "self_time": self_time,
+                "children": children_indices
+            })
+            
+            # Create new call chains for each called function
+            for callee in callees:
+                if callee not in visited and should_include_function(callee):
+                    build_call_chains(callee, current_chain.copy(), visited.copy())
+            
+            current_chain.pop()
+            visited.remove(func_name)
+
+        # Find all root functions and build call chains
+        print("\nCall Tree:")
+        print("==========")
+        
+        # Find all function calls that appear in the code
+        root_functions = set()
+        for func_name in function_indices:
+            if not should_include_function(func_name):
+                continue
+            # A function is a root if it's never called by others
+            # or if it's called directly in the main scope
+            is_called = False
+            for callers in direct_calls.values():
+                if func_name in callers:
+                    is_called = True
+                    break
+            
+            if not is_called:
+                root_functions.add(func_name)
+            
+        # Add functions that are called directly (even if they're also called by other functions)
+        for func, (cc, nc, tt, ct, callers) in stats.stats.items():
+            _, _, func_name = func
+            if not should_include_function(func_name):
+                continue
+            
+            # Check if this function is called directly from main
+            for caller in callers:
+                _, _, caller_name = caller
+                if not should_include_function(caller_name):
+                    root_functions.add(func_name)
+                    break
+
+        # Build and print call chains for all root functions
+        for func_name in root_functions:
+            if should_include_function(func_name):
+                print_call_tree(func_name)
+                build_call_chains(func_name)
+
         return {
             "mode": "function",
             "file": self.target_module.__file__,
-            "results": results  # Use filtered results
+            "results": results,
+            "call_chains": call_chains
         }
-    
-    def _analyze_line_level(self, module) -> Dict[str, Any]:
+
+    def _analyze_line_level(self, module=None):
         """
-        Line-by-line performance analysis.
+        Analyze the line-level performance of code.      
+ 
+        Args:
+            module: The loaded Python module object.
+            
+        Returns:
+            dict: A dictionary containing the line-level analysis results in the following format:
+            {
+                "mode": "line",
+                "file": filename,
+                "results": [
+                    {
+                        "line_number": Line number,
+                        "hits": Number of calls,
+                        "total_time": Total execution time,
+                        "per_hit": Average time per call,
+                        "percent_time": Percentage of total time,
+                        "code": Code content,
+                        "function": Function name it belongs to
+                    },
+                    ...
+                ]
+            }
         """
-        # Get all functions from the module
+            
+        # Get all functions in the module
         functions = self._get_functions_from_module()
         
-        # Add a line_profiler decorator to each function
+        # Add the @profile decorator to each function
         for func_name in functions:
             func = getattr(self.target_module, func_name)
-            self.line_profiler.add_function(func)
+            if callable(func):
+                self.line_profiler.add_function(func)
         
-        # Execute all callable functions in the module
-        self.line_profiler.enable_by_count()
-        exec(open(self.file_path).read(), module.__dict__)
-        self.line_profiler.disable_by_count()
-
-        # Parse line-by-line performance data
-        # self.line_profiler.print_stats()
-        stream = io.StringIO()
-        self.line_profiler.print_stats(stream=stream)
-        stats = stream.getvalue()
-
-        # Parse stats and generate JSON-formatted results
+        # If no functions are found, try executing the file's content directly
+        if not functions:
+            # Execute the file's content
+            self.line_profiler.enable()
+            exec(open(self.file_path).read(), self.target_module.__dict__)
+            self.line_profiler.disable()
+        else:
+            # Execute each function
+            self.line_profiler.enable()
+            for func_name in functions:
+                try:
+                    func = getattr(self.target_module, func_name)
+                    if callable(func):
+                        func()
+                except Exception as e:
+                    # Ignore execution errors and continue analyzing other functions
+                    pass
+            self.line_profiler.disable()
+        
+        # Collect analysis results
+        import io
+        output = io.StringIO()
+        self.line_profiler.print_stats(stream=output)
+        
+        # Parse the output results
         results = []
+        lines = output.getvalue().split('\n')
+        
+        # Skip the header information and parse statistical data line by line
         current_function = None
-        for line in stats.splitlines():
-            if line.startswith("File:"):
-                # Parse file path
-                file_path = line.split("File: ")[1].strip()
-            elif line.startswith("Function:"):
-                # Parse function name
+        for line in lines:
+            # Detect function name lines
+            if line.strip().startswith('Function'):
                 current_function = line.split("Function: ")[1].split(" at ")[0].strip()
-            elif line.strip().startswith("Line #"):
-                # Skip the header
                 continue
-            elif line.strip() and current_function:
-                # Parse each line of performance data
+            
+            # Parse statistical data lines
+            if re.match(r'\s+\d+', line):
                 parts = line.strip().split()
                 if len(parts) >= 6:
-                    line_number = int(parts[0])
-                    hits = int(parts[1])
-                    total_time = float(parts[2])
-                    per_hit = float(parts[3])
-                    percent_time = float(parts[4])
-                    code = " ".join(parts[5:])
-                    results.append({
-                        "line_number": line_number,
-                        "hits": hits,
-                        "total_time": total_time,
-                        "per_hit": per_hit,
-                        "percent_time": percent_time,
-                        "code": code,
-                        "function": current_function
-                    })
-
+                    try:
+                        line_num = int(parts[0])
+                        hits = int(parts[1])
+                        time = float(parts[2])
+                        per_hit = float(parts[3])
+                        percent = float(parts[4].strip('%'))
+                        code = ' '.join(parts[5:])
+                        
+                        results.append({
+                            "line_number": line_num,
+                            "hits": hits,
+                            "total_time": time,
+                            "per_hit": per_hit,
+                            "percent_time": percent,
+                            "code": code,
+                            "function": current_function
+                        })
+                    except (ValueError, IndexError):
+                        # Skip lines that cannot be parsed
+                        pass
+        
+        # Return the analysis results
         return {
             "mode": "line",
-            "file": file_path,
+            "file": self.file_path,
             "results": results
         }
 
@@ -166,5 +363,5 @@ class PerformanceAnalyzer:
 if __name__ == "__main__":
     analyzer = PerformanceAnalyzer()
     
-    result = analyzer.analyze_file("example.py", "function")
+    result = analyzer.analyze_file("example.py", "line")
     print(json.dumps(result, indent=4))
