@@ -333,8 +333,8 @@ class PerformanceAnalyzer:
                     try:
                         line_num = int(parts[0])
                         hits = int(parts[1])
-                        time = float(parts[2])
-                        per_hit = float(parts[3])
+                        time = float(parts[2]) * 1e-09
+                        per_hit = float(parts[3]) * 1e-09
                         percent = float(parts[4].strip('%'))
                         code = ' '.join(parts[5:])
                         
