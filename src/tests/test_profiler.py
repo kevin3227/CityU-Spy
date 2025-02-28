@@ -1,7 +1,10 @@
+import io
 import math
 import types
 from unittest.mock import patch, MagicMock, call, mock_open
 import pytest
+from line_profiler import LineProfiler
+
 from ..profiler import PerformanceAnalyzer
 
 
@@ -246,3 +249,114 @@ class TestAnalyzeFunctionLevel:
             call("  └── child_func (calls: 1, time: 0.200000s)")
         ]
         mock_print.assert_has_calls(expected_calls, any_order=False)
+
+
+def _create_mock_module(functions, file_content="", filename="test.py"):
+    mock_module = types.ModuleType("mock_module")
+    mock_module.__file__ = filename
+    if not functions:
+        return mock_module
+    for func in functions:
+        mock_module.func = MagicMock(__name__=func)
+    return mock_module
+
+
+class TestAnalyzeLineLevel:
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.analyzer = PerformanceAnalyzer()
+        self.mock_line_profiler = MagicMock(spec=LineProfiler)
+        self.analyzer.line_profiler = self.mock_line_profiler
+        yield
+
+    def test_analyze_line_level_with_functions(self):
+        mock_target_module = types.ModuleType("mock_module")
+        mock_target_module.__file__ = "test.py"
+        mock_func1 = MagicMock(__name__="func1")
+        mock_target_module.func1 = mock_func1
+        mock_func2 = MagicMock(__name__="func2")
+        mock_target_module.func2 = mock_func2
+        mock_target_module.file_content = "def func1(): pass\ndef func2(): pass"
+        with patch("importlib.util.spec_from_file_location") as mock_spec, \
+                patch("importlib.util.module_from_spec") as mock_module_from_spec, \
+                patch("builtins.open", mock_open(read_data=mock_target_module.file_content)), \
+                patch.object(self.analyzer, "target_module", mock_target_module), \
+                patch.object(self.analyzer, "line_profiler", self.mock_line_profiler):
+            mock_spec.return_value = MagicMock()
+            mock_module_from_spec.return_value = mock_target_module
+
+            self.analyzer.file_path = "test.py"
+            result = self.analyzer._analyze_line_level()
+
+            assert result["mode"] == "line"
+            assert result["file"] == "test.py"
+            assert isinstance(result["results"], list)
+            expected_calls = [
+                call(mock_func1),
+                call(mock_func2)
+            ]
+            self.mock_line_profiler.add_function.assert_has_calls(expected_calls, any_order=True)
+            self.mock_line_profiler.enable.assert_called_once()
+            self.mock_line_profiler.disable.assert_called_once()
+
+    def test_analyze_line_level_with_non_functions(self):
+        mock_target_module = types.ModuleType("mock_module")
+        mock_target_module.__file__ = "empty.py"
+        mock_target_module.func = None
+        file_content = ""
+
+        with patch("importlib.util.spec_from_file_location"), \
+                patch("importlib.util.module_from_spec"), \
+                patch("builtins.open", mock_open(read_data=file_content)), \
+                patch.object(self.analyzer, "target_module", mock_target_module), \
+                patch("builtins.exec"):
+            result = self.analyzer._analyze_line_level()
+            assert isinstance(result["results"], list)
+            assert result["results"] == []
+
+    def test_analyze_line_level_output_parsing(self):
+        mock_target_module = types.ModuleType("mock_module")
+        mock_target_module.__file__ = "test.py"
+        mock_func = MagicMock(__name__="my_function")
+        mock_target_module.func1 = mock_func
+        file_content = 'def my_function(): print(42) return 42\n'
+        fake_output = """
+    Function: my_function at line 5
+    Line #      Hits         Time  Per Hit   % Time  Line Contents
+    ==============================================================
+         5                                           def my_function():
+         6         2        100.0     50.0     50.0       print(42)
+         7         1         50.0     50.0     25.0       return 42
+            """
+
+        with patch("importlib.util.spec_from_file_location") as mock_spec, \
+                patch("importlib.util.module_from_spec") as mock_module_from_spec, \
+                patch("builtins.open", mock_open(read_data=file_content)), \
+                patch.object(self.analyzer, "target_module", mock_target_module), \
+                patch.object(self.analyzer, "line_profiler", self.mock_line_profiler), \
+                patch("io.StringIO") as mock_string_io:
+            mock_spec.return_value = MagicMock()
+            mock_module_from_spec.return_value = mock_target_module
+            mock_stream = MagicMock()
+            mock_stream.getvalue.return_value = fake_output
+            mock_string_io.return_value = mock_stream
+
+            result = self.analyzer._analyze_line_level()
+            assert len(result["results"]) == 2
+            assert result["results"][0]["line_number"] == 6
+            assert result["results"][0]["code"] == 'print(42)'
+            assert result["results"][1]["percent_time"] == 25.0
+
+    def test_analyze_line_level_with_error(self):
+        mock_target_module = types.ModuleType("mock_module")
+        mock_target_module.__file__ = "error.py"
+        mock_func = MagicMock(__name__="func")
+        mock_target_module.func = mock_func
+        mock_target_module.func.side_effect = Exception("test error")
+
+        with patch.object(self.analyzer, "target_module", mock_target_module):
+            result = self.analyzer._analyze_line_level()
+            mock_target_module.func.assert_called_once()
+            assert isinstance(result, dict)
+            assert "results" in result
