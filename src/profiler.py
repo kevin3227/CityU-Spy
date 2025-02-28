@@ -363,5 +363,5 @@ class PerformanceAnalyzer:
 if __name__ == "__main__":
     analyzer = PerformanceAnalyzer()
     
-    result = analyzer.analyze_file("example.py", "line")
+    result = analyzer.analyze_file("example.py", "function")
     print(json.dumps(result, indent=4))
