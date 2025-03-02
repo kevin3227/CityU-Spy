@@ -1,4 +1,5 @@
 import cProfile
+import os
 import pstats
 import io
 import importlib.util
@@ -362,6 +363,5 @@ class PerformanceAnalyzer:
 # Test code
 if __name__ == "__main__":
     analyzer = PerformanceAnalyzer()
-    
-    result = analyzer.analyze_file("example.py", "function")
+    result = analyzer.analyze_file("../../data/sample_code/example2.py", "function")
     print(json.dumps(result, indent=4))

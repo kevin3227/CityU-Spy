@@ -1,11 +1,9 @@
-import io
 import math
 import types
 from unittest.mock import patch, MagicMock, call, mock_open
 import pytest
 from line_profiler import LineProfiler
-
-from ..profiler import PerformanceAnalyzer
+from Py_Spy.profiler import PerformanceAnalyzer
 
 
 @pytest.fixture
