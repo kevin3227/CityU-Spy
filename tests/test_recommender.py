@@ -1,5 +1,4 @@
-import pytest
-from ../src.recommender import generate_optimization_suggestions, ASTVisitor, OPTIMIZATION_RULES
+from Py_Spy.recommender import generate_optimization_suggestions, ASTVisitor
 import ast
 
 
@@ -31,7 +30,7 @@ def call_process_data_1():
     """
     analysis_result = {
         "mode": "function",
-        "file": "example.py",
+        "file": "data/sample_code/example2.py",
         "results": [
             {
                 "function": "process_data",
@@ -87,7 +86,7 @@ def call_process_data_1():
     """
     analysis_result = {
         "mode": "line",
-        "file": "example.py",
+        "file": "data/sample_code/example2.py",
         "results": [
             {
                 "line_number": 2,
@@ -168,7 +167,7 @@ def process_data():
     """
     analysis_result = {
         "mode": "memory",
-        "file": "example.py",
+        "file": "data/sample_code/example2.py",
         "results": [
             {
                 "line_number": 2,
@@ -227,7 +226,7 @@ def call_process_data_1():
     analysis_result = {
         "function": {
             "mode": "function",
-            "file": "example.py",
+            "file": "data/sample_code/example2.py",
             "results": [
                 {
                     "function": "process_data",
@@ -255,7 +254,7 @@ def call_process_data_1():
         },
         "line": {
             "mode": "line",
-            "file": "example.py",
+            "file": "data/sample_code/example2.py",
             "results": [
                 {
                     "line_number": 2,
@@ -315,7 +314,7 @@ def call_process_data_1():
         },
         "memory": {
             "mode": "memory",
-            "file": "example.py",
+            "file": "data/sample_code/example2.py",
             "results": [
                 {
                     "line_number": 2,
