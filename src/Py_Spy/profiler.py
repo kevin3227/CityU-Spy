@@ -1,9 +1,10 @@
 import cProfile
+import os
 import pstats
 import io
 import importlib.util
-# import ast
 import re
+import sys
 from line_profiler import LineProfiler
 from memory_profiler import profile
 import json
@@ -16,6 +17,8 @@ class PerformanceAnalyzer:
         self.memory_profile_results = []
         self.target_module = None
         self.file_path = None
+        self.call_stack_data = []  # Stores call stack information
+        self.current_stack = []    # Current call stack
 
     def load_module_from_file(self, file_path: str) -> Optional[Any]:
         """
@@ -61,10 +64,57 @@ class PerformanceAnalyzer:
             return self._analyze_function_level(module)
         elif mode == "line":
             return self._analyze_line_level(module)
-        # elif mode == "memory":
-        #     return self._analyze_memory_usage(module)
         else:
             return {"error": "Unsupported analysis mode"}
+
+    def _trace_calls(self, frame, event, arg):
+        """
+        Trace function to track function calls and returns for building call stack.
+        """
+        if event == 'call':
+            # Get the current function information
+            func_name = frame.f_code.co_name
+            file_name = frame.f_code.co_filename
+            line_number = frame.f_lineno
+            
+            # Update the current call stack
+            self.current_stack.append(func_name)
+            
+            # Record call information
+            call_info = {
+                'function': func_name,
+                'file': file_name,
+                'line': line_number,
+                'stack': list(self.current_stack)  # Copy the current call stack
+            }
+            self.call_stack_data.append(call_info)
+            
+        elif event == 'return':
+            # Update the call stack when the function returns
+            func_name = frame.f_code.co_name
+            if self.current_stack and self.current_stack[-1] == func_name:
+                self.current_stack.pop()
+        
+        return self._trace_calls
+    
+    def _calculate_call_chain_counts(self, call_stacks):
+        """
+        Calculate the number of calls in the call chain.
+        
+        :param call_stacks: Call stack list containing information for each call (function name, call chain, etc.).
+        :return: Dictionary containing call chains and their occurrence counts.
+        """
+        call_chain_counts = {}
+
+        for entry in call_stacks:
+            # Convert stack to a tuple (immutable type) to use as a dictionary key
+            call_chain = tuple(entry['stack'])
+            
+            if call_chain not in call_chain_counts:
+                call_chain_counts[call_chain] = 0
+            call_chain_counts[call_chain] += 1
+
+        return call_chain_counts
 
     def _analyze_function_level(self, module) -> Dict[str, Any]:
         """
@@ -82,13 +132,24 @@ class PerformanceAnalyzer:
                 '<listcomp>',
                 '__init__',
                 'decode',
-                '<'  # Filter out all special functions starting with '<'
+                '<'  # Filters out all special functions starting with '<'
             ]
             return not any(func_name.startswith(exc) for exc in exclusions)
 
+        # Clear call stack data
+        self.call_stack_data = []
+        self.current_stack = []
+        
+        # Start tracing and profiling
+        sys.settrace(self._trace_calls)
         self.profiler.enable()
+        
+        # Execute the code
         exec(open(self.file_path).read(), module.__dict__)
+        
+        # Stop tracing
         self.profiler.disable()
+        sys.settrace(None)
 
         # Parse performance data
         stream = io.StringIO()
@@ -100,9 +161,9 @@ class PerformanceAnalyzer:
         
         # Extract function-level performance data and assign indices
         function_indices = {}  # Map function names to their indices in results
-        average_time_map = {}   # Map function names to their total time
-        call_count_map = {}   # Map function names to their call count
-        direct_calls = {}     # Map of direct caller-callee relationships
+        average_time_map = {}  # Map function names to their total time
+        call_count_map = {}    # Map function names to their call count
+        direct_calls = {}      # Map of direct caller-callee relationships
 
         # First pass: collect basic function information and build direct call relationships
         for func, (cc, nc, tt, ct, callers) in stats.stats.items():
@@ -152,16 +213,14 @@ class PerformanceAnalyzer:
             
             # Print current function
             prefix = "  " * indent + "└── " if indent > 0 else ""
-            calls = call_count_map.get(func_name, 0)
-            time = average_time_map.get(func_name, 0)
-            print(f"{prefix}{func_name} (calls: {calls}, time: {time:.6f}s)")
+            print(f"{prefix}{func_name}")
             
             # Recursively print called functions
             callees = direct_calls.get(func_name, set())
             for callee in callees:
                 if callee not in visited and should_include_function(callee):
                     print_call_tree(callee, indent + 1, visited.copy(), chain.copy())
-                        
+
         def build_call_chains(func_name, current_chain=None, visited=None):
             """
             Builds the call chains.
@@ -195,7 +254,7 @@ class PerformanceAnalyzer:
             # Add current call chain
             call_chains.append({
                 "chain": current_chain.copy(),
-                "count": call_count_map[func_name],
+                "count": 0,  # Updated with actual call chain counts later
                 "self_time": self_time,
                 "children": children_indices
             })
@@ -247,11 +306,35 @@ class PerformanceAnalyzer:
                 print_call_tree(func_name)
                 build_call_chains(func_name)
 
+        # Process and filter call stack information
+        call_stacks = []
+        for call_info in self.call_stack_data:
+            func_name = call_info['function']
+            if should_include_function(func_name):
+                # Filter special functions from the call stack
+                filtered_stack = [f for f in call_info['stack'] if should_include_function(f)]
+                if filtered_stack:  # Add only if the filtered call stack is not empty
+                    call_stacks.append({
+                        "function": func_name,
+                        "stack": filtered_stack,
+                        "line": call_info['line']
+                    })
+        
+        # Calculate the number of calls in the call chain
+        call_chain_counts = self._calculate_call_chain_counts(call_stacks)
+        
+        # Update the count field in call_chains
+        for call_chain in call_chains:
+            chain_tuple = tuple(call_chain["chain"])
+            if chain_tuple in call_chain_counts:
+                call_chain["count"] = call_chain_counts[chain_tuple]
+
         return {
             "mode": "function",
             "file": self.target_module.__file__,
             "results": results,
-            "call_chains": call_chains
+            "call_chains": call_chains,
+            "call_stacks": call_stacks
         }
 
     def _analyze_line_level(self, module=None):
@@ -362,6 +445,5 @@ class PerformanceAnalyzer:
 # Test code
 if __name__ == "__main__":
     analyzer = PerformanceAnalyzer()
-    
-    result = analyzer.analyze_file("example.py", "line")
+    result = analyzer.analyze_file("../../data/sample_code/example2.py", "function")
     print(json.dumps(result, indent=4))
