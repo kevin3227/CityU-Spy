@@ -8,6 +8,7 @@ def call_process_data_0():
 
 def call_process_data_1():
     call_process_data_0()
+    call_process_data_0()
     return
 
 call_process_data_0()
