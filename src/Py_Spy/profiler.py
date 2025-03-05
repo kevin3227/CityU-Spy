@@ -1,5 +1,4 @@
 import cProfile
-import os
 import pstats
 import io
 import importlib.util
