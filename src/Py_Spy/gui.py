@@ -13,6 +13,9 @@ class PerformanceGUI:
         master.title("Python performance analysis tool")
         master.geometry("1200x800")
 
+        # Bind the "X" button (window close) event
+        self.master.protocol("WM_DELETE_WINDOW", self.close_application)
+
         # Initialize performance analyzer
         self.analyzer = PerformanceAnalyzer()
         self.current_data = None
@@ -37,6 +40,9 @@ class PerformanceGUI:
 
         # Analysis button
         ttk.Button(control_frame, text="Start analyzing", command=self.run_analysis).pack(side=tk.LEFT, padx=5)
+
+        # Close/Exit button
+        ttk.Button(control_frame, text="Exit", command=self.close_application).pack(side=tk.LEFT, padx=5)
 
         # Result display area
         self.notebook = ttk.Notebook(self.master)
@@ -84,22 +90,22 @@ class PerformanceGUI:
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.flame_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-    # def update_flame_graph(self):
-    #     if self.current_data is None:
-    #         return
-    #
-    #     self.ax.clear()
-    #
-    #     # Build mapping of functions to total runtime from analysis results
-    #     func_times = {item["function"]: item["total_time"] for item in self.current_data["results"]}
-    #
-    #     # Define root nodes as chains with length 1
-    #     root_chains = [cc["chain"] for cc in self.current_data["call_chains"] if len(cc["chain"]) == 1]
-    #     if not root_chains:
-    #         return
-    #
-    #     # Calculate overall total time as sum of root node runtimes
-    #     overall_total = sum(func_times.get(chain[0], 0) for chain in root_chains)
+    def update_flame_graph(self):
+        if self.current_data is None:
+            return
+
+        self.ax.clear()
+
+        # Build mapping of functions to total runtime from analysis results
+        func_times = {item["function"]: item["total_time"] for item in self.current_data["results"]}
+
+        # Define root nodes as chains with length 1
+        root_chains = [cc["chain"] for cc in self.current_data["call_chains"] if len(cc["chain"]) == 1]
+        if not root_chains:
+            return
+
+        # Calculate overall total time as sum of root node runtimes
+        overall_total = sum(func_times.get(chain[0], 0) for chain in root_chains)
 
         # Helper function to generate random warm colors
         def get_random_warm_color():
@@ -151,6 +157,11 @@ class PerformanceGUI:
         self.ax.set_ylabel("Stack depth")
         # Do not invert y-axis to keep root nodes at the bottom
         self.canvas.draw()
+
+    def close_application(self):
+        """Gracefully close the application."""
+        self.master.quit()  # Exit the main loop
+        self.master.destroy()  # Destroy the main window
 
 
 if __name__ == "__main__":

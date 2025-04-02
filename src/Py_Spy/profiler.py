@@ -1,23 +1,142 @@
 import cProfile
+import re
+import yappi
 import pstats
 import io
 import importlib.util
-import re
+# import re
+import subprocess
+from memory_profiler import memory_usage, profile
 import sys
 from line_profiler import LineProfiler
 from memory_profiler import profile
 import json
+import threading
+import time
+import traceback
+from collections import Counter
+import os
+
 from typing import Dict, List, Any, Optional
 
+class ThreadSampler:
+    def __init__(self, interval=1e-5, fine_grained=False):
+        self.interval = interval  # Sampling interval (seconds)
+        self.running = False      # Flag to control the sampling thread's state
+        self.samples = []         # List of collected samples
+        self.sampling_thread = None  # Thread object that performs sampling
+        self.fine_grained = fine_grained  # Whether to use fine-grained sampling
+        self.call_stack_data = []  # Stores call stack information for fine-grained sampling
+        self.current_stack = []    # Current call stack for fine-grained sampling
+
+    def _trace_calls(self, frame, event, arg):
+        """
+        Trace function to track function calls and returns for building call stack.
+        """
+        if event == 'call':
+            # Get the current function information
+            func_name = frame.f_code.co_name
+            file_name = frame.f_code.co_filename
+            line_number = frame.f_lineno
+            
+            # Update the current call stack
+            self.current_stack.append(func_name)
+            
+            # Record call information
+            call_info = {
+                'function': func_name,
+                'file': file_name,
+                'line': line_number,
+                'stack': list(self.current_stack)  # Copy the current call stack
+            }
+            self.call_stack_data.append(call_info)
+            
+        elif event == 'return':
+            # Update the call stack when the function returns
+            func_name = frame.f_code.co_name
+            if self.current_stack and self.current_stack[-1] == func_name:
+                self.current_stack.pop()
+        
+        return self._trace_calls
+
+    def sample(self):
+        if self.fine_grained:
+            sys.settrace(self._trace_calls)
+        else:
+            while self.running:
+                sample = []
+                # Get current frames of all threads
+                for thread_id, frame in sys._current_frames().items():
+                    # Skip the current thread (the sampler itself)
+                    if threading.get_ident() == thread_id:
+                        continue
+                    
+                    # Find the corresponding thread's name
+                    thread_name = "Unknown"
+                    for t in threading.enumerate():
+                        if t.ident == thread_id:
+                            thread_name = t.name
+                            break
+                    
+                    # Extract call stack
+                    stack = traceback.extract_stack(frame)
+                    # Format stack into FlameGraph-compatible format (e.g., "func(file:lineno") 
+                    formatted_stack = ";".join([
+                        f"{frame.name}({os.path.basename(frame.filename)}:{frame.lineno})"
+                        for frame in stack
+                    ])
+                    
+                    # Prepend thread name as the root of the stack
+                    formatted_stack = f"Thread-{thread_name};{formatted_stack}"
+                    sample.append(formatted_stack)
+                
+                self.samples.extend(sample)
+                time.sleep(self.interval)  # Wait for the sampling interval
+
+    def start(self):
+        """Start sampling thread or settrace"""
+        self.running = True
+        if not self.fine_grained:
+            self.sampling_thread = threading.Thread(target=self.sample, daemon=True)
+            self.sampling_thread.start()
+        else:
+            self.sample()
+
+    def stop(self):
+        """Stop sampling and wait for thread termination or reset settrace"""
+        self.running = False
+        if self.fine_grained:
+            sys.settrace(None)
+        else:
+            if self.sampling_thread:
+                self.sampling_thread.join(timeout=1.0)  # Set timeout in case thread hangs
+
+    def save_to_flamegraph_file(self, filename):
+        if self.fine_grained:
+            # Process call_stack_data for fine-grained sampling
+            counter = Counter([";".join(call_info['stack']) for call_info in self.call_stack_data])
+        else:
+            # Aggregate stack samples by count
+            counter = Counter(self.samples)
+        
+        with open(filename, "w") as f:
+            for stack, count in counter.items():
+                f.write(f"{stack} {count}\n")
+        print(f"Saved FlameGraph data to '{filename}', {len(counter)} unique stacks, "
+              f"{sum(counter.values())} total samples.")
+        return counter
+
 class PerformanceAnalyzer:
-    def __init__(self):
+    def __init__(self, mthread=False, fine_grained=False):
         self.profiler = cProfile.Profile()
         self.line_profiler = LineProfiler()
-        self.memory_profile_results = []
+        self.memory_profile_results = []  # Stores memory profiling results
         self.target_module = None
         self.file_path = None
+        self.fine_grained = fine_grained
         self.call_stack_data = []  # Stores call stack information
         self.current_stack = []    # Current call stack
+        self.mthread = mthread
 
     def load_module_from_file(self, file_path: str) -> Optional[Any]:
         """
@@ -63,6 +182,8 @@ class PerformanceAnalyzer:
             return self._analyze_function_level(module)
         elif mode == "line":
             return self._analyze_line_level(module)
+        elif mode == "memory":
+            return self._analyze_memory_level(module)
         else:
             return {"error": "Unsupported analysis mode"}
 
@@ -115,225 +236,146 @@ class PerformanceAnalyzer:
 
         return call_chain_counts
 
+    def _build_call_tree(self, samples_counter):
+        """
+        Build a call tree from the sampled data.
+        Args:
+            samples_counter: A Counter object containing call stacks and their frequencies.
+        Returns:
+            A tree structure representing the call hierarchy.
+        """
+        tree = {}
+
+        for stack, count in samples_counter.items():
+            stack_parts = stack.split(";")
+            current_node = tree
+
+            # Build the tree hierarchy based on stack levels
+            for part in stack_parts:
+                if part not in current_node:
+                    current_node[part] = {"count": 0, "children": {}}
+                current_node[part]["count"] += count
+                current_node = current_node[part]["children"]
+
+        return tree
+
+    def _print_call_tree(self, tree, indent="", is_last=True):
+        """
+        Print the call tree in a structured format.
+        Args:
+            tree: The constructed call tree.
+            indent: Current indentation level for formatting.
+            is_last: Whether the current node is the last in its level.
+        """
+        for i, (key, value) in enumerate(tree.items()):
+            prefix = indent + ("└── " if is_last and i == len(tree) - 1 else "├── ")
+            print(f"{prefix}{key} [{value['count']}]")
+            # Recursively print child nodes
+            child_count = len(value["children"])
+            for j, (child_key, child_value) in enumerate(value["children"].items()):
+                self._print_call_tree(
+                    {child_key: child_value},
+                    indent + ("    " if is_last and i == len(tree) - 1 else "│   "),
+                    j == child_count - 1,
+                )
+
     def _analyze_function_level(self, module) -> Dict[str, Any]:
         """
         Function-level performance analysis.
         """
-        def should_include_function(func_name: str) -> bool:
-            """
-            Determines whether this function should be included in the analysis results.
-            """
-            # Filters out the following types of functions:
-            exclusions = [
-                '<built-in',
-                '<method',
-                '<module>',
-                '<listcomp>',
-                '__init__',
-                'decode',
-                '<'  # Filters out all special functions starting with '<'
-            ]
-            return not any(func_name.startswith(exc) for exc in exclusions)
+        functions = self._get_functions_from_module()
 
+        if self.mthread:
+            self.fine_grained = False
+        
         # Clear call stack data
         self.call_stack_data = []
         self.current_stack = []
-        
-        # Start tracing and profiling
-        sys.settrace(self._trace_calls)
-        self.profiler.enable()
-        
-        # Execute the code
-        exec(open(self.file_path).read(), module.__dict__)
-        
-        # Stop tracing
-        self.profiler.disable()
-        sys.settrace(None)
-
-        # Parse performance data
-        stream = io.StringIO()
-        stats = pstats.Stats(self.profiler, stream=stream)
-        stats.strip_dirs().sort_stats('cumulative')
 
         results = []
         call_chains = []
         
-        # Extract function-level performance data and assign indices
-        function_indices = {}  # Map function names to their indices in results
-        average_time_map = {}  # Map function names to their total time
-        call_count_map = {}    # Map function names to their call count
-        direct_calls = {}      # Map of direct caller-callee relationships
+        # Start profiling
+        sampler = ThreadSampler(fine_grained=self.fine_grained)
+        sampler.start()
 
-        # First pass: collect basic function information and build direct call relationships
-        for func, (cc, nc, tt, ct, callers) in stats.stats.items():
-            _, line_number, function_name = func
-            
-            # Add filtering condition
-            if not should_include_function(function_name):
-                continue
-                
-            function_indices[function_name] = len(results)
-            call_count_map[function_name] = nc
-            average_time_map[function_name] = ct / nc if nc > 0 else 0
-            
-            # Record direct caller-callee relationships
-            for caller, caller_stats in callers.items():
-                _, _, caller_name = caller
-                # Add filtering condition
-                if not should_include_function(caller_name):
+        if self.mthread:
+            yappi.start(profile_threads=True, builtins=False)
+
+        else:
+            self.profiler.enable()
+        
+        # Execute the code
+        exec(open(self.file_path).read(), module.__dict__)
+        
+        # Stop profiling
+        sampler.stop()
+        if self.mthread:
+            yappi.stop()
+            stats = yappi.get_func_stats()
+            for func_stat in stats:
+                if not any(item in func_stat.full_name for item in functions):
                     continue
-                if caller_name not in direct_calls:
-                    direct_calls[caller_name] = set()
-                direct_calls[caller_name].add(function_name)
-            
-            results.append({
-                "function": function_name,
-                "calls": nc,
-                "total_time": ct,
-                "average_time": ct / nc if nc > 0 else 0,
-                "line_number": line_number,
-            })
+                results.append({
+                    "function": func_stat.full_name.split(" ")[-1],
+                    "calls": func_stat.ncall,
+                    "total_time": func_stat.ttot,
+                    "average_time": func_stat.ttot / func_stat.ncall if func_stat.ncall > 0 else 0
+                    # "sub_calls": [(sub_call.full_name, sub_call.ncall, sub_call.ttot) for sub_call in func_stat.children]
+                })
 
-        def print_call_tree(func_name, indent=0, visited=None, chain=None):
-            """
-            Prints the function call tree.
-            """
-            if visited is None:
-                visited = set()
-            if chain is None:
-                chain = []
-                
-            if func_name in visited:
-                print("  " * indent + f"└── {func_name} (recursive call)")
-                return
-                
-            visited.add(func_name)
-            chain.append(func_name)
-            
-            # Print current function
-            prefix = "  " * indent + "└── " if indent > 0 else ""
-            print(f"{prefix}{func_name}")
-            
-            # Recursively print called functions
-            callees = direct_calls.get(func_name, set())
-            for callee in callees:
-                if callee not in visited and should_include_function(callee):
-                    print_call_tree(callee, indent + 1, visited.copy(), chain.copy())
+            # Clear Yappi stats
+            yappi.clear_stats()
 
-        def build_call_chains(func_name, current_chain=None, visited=None):
-            """
-            Builds the call chains.
-            """
-            if visited is None:
-                visited = set()
-            if current_chain is None:
-                current_chain = []
-                
-            if func_name in visited:
-                return
-                
-            visited.add(func_name)
-            current_chain.append(func_name)
-            
-            # Get directly called functions
-            callees = direct_calls.get(func_name, set())
-            
-            # Create list of indices for current chain's children
-            children_indices = []
-            for callee in callees:
-                if callee in function_indices and should_include_function(callee):
-                    children_indices.append(function_indices[callee])
-            
-            # Calculate self_time
-            self_time = average_time_map[func_name]
-            for callee in callees:
-                if callee in average_time_map and should_include_function(callee):
-                    self_time -= average_time_map[callee]
-            
-            # Add current call chain
-            call_chains.append({
-                "chain": current_chain.copy(),
-                "count": 0,  # Updated with actual call chain counts later
-                "self_time": self_time,
-                "children": children_indices
-            })
-            
-            # Create new call chains for each called function
-            for callee in callees:
-                if callee not in visited and should_include_function(callee):
-                    build_call_chains(callee, current_chain.copy(), visited.copy())
-            
-            current_chain.pop()
-            visited.remove(func_name)
+        else:
+            self.profiler.disable()
+            # Parse performance data
+            stream = io.StringIO()
+            stats = pstats.Stats(self.profiler, stream=stream)
+            stats.strip_dirs().sort_stats('cumulative')
 
-        # Find all root functions and build call chains
+            # First pass: collect basic function information and build direct call relationships
+            for func, (cc, nc, tt, ct, callers) in stats.stats.items():
+                _, line_number, function_name = func
+                if not any(item in function_name for item in functions):
+                    continue
+                results.append({
+                    "function": function_name,
+                    "calls": nc,
+                    "total_time": ct,
+                    "average_time": ct / nc if nc > 0 else 0,
+                    "line_number": line_number,
+                })
+
+        # Generate FlameGraph data
+        output_filename = f"{os.path.splitext(self.file_path)[0]}_flamegraph.txt"
+        samples_counter = sampler.save_to_flamegraph_file(output_filename)
+
+        for call_chain, count in samples_counter.items():
+            # call_chain = call_chain.split(" ")[0]
+            # call_chain = [
+            #     next(func for func in functions if func in item)
+            #     for item in call_chain.split(";")
+            #     if any(func in item for func in functions) and 'Thread' not in item
+            # ]            
+            
+            if len(call_chain) > 0:
+                call_chains.append({
+                    "chain": call_chain.split(";"),
+                    "count": count,
+                    "percentage": (count / sum(samples_counter.values())) * 100
+                })
+
+        # Build call tree
+        call_tree = self._build_call_tree(samples_counter)
         print("\nCall Tree:")
-        print("==========")
-        
-        # Find all function calls that appear in the code
-        root_functions = set()
-        for func_name in function_indices:
-            if not should_include_function(func_name):
-                continue
-            # A function is a root if it's never called by others
-            # or if it's called directly in the main scope
-            is_called = False
-            for callers in direct_calls.values():
-                if func_name in callers:
-                    is_called = True
-                    break
-            
-            if not is_called:
-                root_functions.add(func_name)
-            
-        # Add functions that are called directly (even if they're also called by other functions)
-        for func, (cc, nc, tt, ct, callers) in stats.stats.items():
-            _, _, func_name = func
-            if not should_include_function(func_name):
-                continue
-            
-            # Check if this function is called directly from main
-            for caller in callers:
-                _, _, caller_name = caller
-                if not should_include_function(caller_name):
-                    root_functions.add(func_name)
-                    break
-
-        # Build and print call chains for all root functions
-        for func_name in root_functions:
-            if should_include_function(func_name):
-                print_call_tree(func_name)
-                build_call_chains(func_name)
-
-        # Process and filter call stack information
-        call_stacks = []
-        for call_info in self.call_stack_data:
-            func_name = call_info['function']
-            if should_include_function(func_name):
-                # Filter special functions from the call stack
-                filtered_stack = [f for f in call_info['stack'] if should_include_function(f)]
-                if filtered_stack:  # Add only if the filtered call stack is not empty
-                    call_stacks.append({
-                        "function": func_name,
-                        "stack": filtered_stack,
-                        "line": call_info['line']
-                    })
-        
-        # Calculate the number of calls in the call chain
-        call_chain_counts = self._calculate_call_chain_counts(call_stacks)
-        
-        # Update the count field in call_chains
-        for call_chain in call_chains:
-            chain_tuple = tuple(call_chain["chain"])
-            if chain_tuple in call_chain_counts:
-                call_chain["count"] = call_chain_counts[chain_tuple]
+        self._print_call_tree(call_tree)
 
         return {
             "mode": "function",
-            "file": self.target_module.__file__,
+            "file": self.file_path,
             "results": results,
-            "call_chains": call_chains,
-            "call_stacks": call_stacks
+            "call_chains": call_chains
         }
 
     def _analyze_line_level(self, module=None):
@@ -439,10 +481,156 @@ class PerformanceAnalyzer:
             "file": self.file_path,
             "results": results
         }
+    
+    def _analyze_memory_level(self, module=None):
+        """
+        Analyze the memory usage of the code.
+        
+        Args:
+            module: The loaded Python module object.
+            
+        Returns:
+            dict: A dictionary containing the memory analysis results in the following format:
+            {
+                "mode": "memory",
+                "file": filename,
+                "results": [
+                    {
+                        "line_number": Line number,
+                        "memory_usage": Memory usage in MB,
+                        "code": Code content
+                    },
+                    ...
+                ]
+            }
+        """
+        results = []
+        output_stream = io.StringIO()
+        # Profile memory usage for each function
+        functions = self._get_functions_from_module()
+        for func_name in functions:
+            func = getattr(self.target_module, func_name)
+            if callable(func):
+                # Decorate the function with @profile
+                profiled_func = profile(func, stream=output_stream)
+                # Execute the function to trigger memory profiling
+                profiled_func()
+                
+                output = output_stream.getvalue()
+                lines = output.splitlines()
+            
+                results.append({
+                    "function": func_name,
+                    "memory_usage": lines
+                })
+        
+        filtered_results = []
+        
+        for item in results:
+            function_name = item['function']
+            memory_lines = item['memory_usage']
+            
+            filtered_lines = []
+            for line in memory_lines:
+                # Look for lines that start with a number (line number)
+                if line.strip() and line.strip()[0].isdigit():
+                    filtered_lines.append(line)
+            
+            # Find the section that matches the current function
+            # Look for the line that defines the current function
+            relevant_lines = []
+            found_function = False
+            for line in filtered_lines:
+                if f'def {function_name}(' in line:
+                    found_function = True
+                if found_function:
+                    relevant_lines.append(line)
+                    # Check if this is a return line (simple heuristic for end of function)
+                    if 'return' in line:
+                        break
+            
+            filtered_results.append({
+                'function': function_name,
+                'memory_usage': relevant_lines
+            })
+
+            parsed_results = []
+            
+            for item in filtered_results:
+                function_name = item['function']
+                memory_lines = item['memory_usage']
+                
+                parsed_lines = []
+                for line in memory_lines:
+                    # Skip lines that aren't data lines (don't start with line number)
+                    if not line.strip() or not line.strip()[0].isdigit():
+                        continue
+                    
+                    # Split into components (assuming fixed-width formatting)
+                    line_num = line[:8].strip()
+                    mem_usage = line[8:19].strip()
+                    increment = line[19:32].strip()
+                    occurrences = line[32:44].strip()
+                    content = line[44:].strip()
+                    
+                    parsed_lines.append({
+                        'Line': line_num,
+                        'Mem usage': mem_usage,
+                        'Increment': increment,
+                        'Occurrences': occurrences,
+                        'Line Contents': content
+                    })
+                
+                parsed_results.append({
+                    'function': function_name,
+                    'memory_usage': parsed_lines
+                })
+
+                # try:
+                #     # Execute the function and capture memory usage
+                #     mem_usage = memory_usage((profiled_func, (), {}), interval=0.01, timeout=1)
+                #     results.append({
+                #         "function": func_name,
+                #         "memory_usage": max(mem_usage)
+                #     })
+                # except Exception as e:
+                #     print(f"Failed to profile memory usage for function {func_name}: {e}")
+        # If no functions are found, profile the entire script
+        if not functions:
+            try:
+                # Execute the entire script in a subprocess with memory profiling
+                result = subprocess.run(
+                    ["mprof", "run", "--python", self.file_path],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    # Parse the memory profile output
+                    # mprof_file = "mprofile_*.dat"
+                    mem_usage = memory_usage((exec, (open(self.file_path).read(), module.__dict__)), interval=0.1, timeout=1)
+                    results.append({
+                        "file": self.file_path,
+                        "memory_usage": max(mem_usage) if mem_usage else 0
+                    })
+                else:
+                    print(f"Failed to profile memory usage for the entire script: {result.stderr}")
+            except Exception as e:
+                print(f"Failed to profile memory usage for the entire script: {e}")
+        return {
+            "mode": "memory",
+            "file": self.file_path,
+            "results": parsed_results
+        }
 
 
 # Test code
 if __name__ == "__main__":
-    analyzer = PerformanceAnalyzer()
-    result = analyzer.analyze_file("../../data/sample_code/example2.py", "function")
+    # mthread = False
+    mthread = True
+    analyzer = PerformanceAnalyzer(mthread, fine_grained=True)
+    if mthread:
+        result = analyzer.analyze_file("../../data/sample_code/multi.py", "function")
+    else:
+        result = analyzer.analyze_file("../../data/sample_code/example2.py", "function")
+    # result = analyzer.analyze_file("../../data/sample_code/example2.py", "memory")
     print(json.dumps(result, indent=4))
