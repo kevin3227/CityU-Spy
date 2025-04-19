@@ -1,118 +1,209 @@
 import ast
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Callable
 
-# Build an initial optimization rule library with detailed modification suggestions
-OPTIMIZATION_RULES = {
-    "loop_optimization": {
-        "description": "Avoid unnecessary calculations inside loops. Move invariant calculations outside the loop.",
-        "check": lambda node: isinstance(node, ast.For) or isinstance(node, ast.While),
-        "suggestion": "If there are calculations that don't depend on the loop variable, move them outside the loop. For example, if you have a constant value calculation like 'result = 2 + 3' inside a loop, move it before the loop."
-    },
-    "redundant_calculation": {
-        "description": "Avoid redundant calculations. If a value is calculated multiple times with the same input, consider caching it.",
-        "check": lambda node: isinstance(node, ast.BinOp) and isinstance(getattr(node, 'parent', None), ast.For),
-        "suggestion": "Identify calculations that are repeated with the same input. You can store the result of the first calculation in a variable and reuse it instead of recalculating. For example, if you have 'result = 2 + 3' multiple times, calculate it once and reuse the variable."
-    },
-    "cache_suggestion": {
-        "description": "Consider using caching for functions with expensive calculations. You can use functools.lru_cache for simple cases.",
-        "check": lambda node: isinstance(node, ast.FunctionDef),
-        "suggestion": "If the function performs expensive calculations and the same input is likely to be used multiple times, you can use the 'functools.lru_cache' decorator. For example, add '@functools.lru_cache(maxsize=128)' above the function definition."
-    },
-    "function_call_optimization": {
-        "description": "If a function is called frequently and has a high execution time, consider optimizing its implementation or reducing the number of calls.",
-        "check": lambda func_stats: func_stats["total_time"] > 1 and func_stats["calls"] > 10,
-        "suggestion": "Review the function implementation to see if there are any inefficiencies. You can also try to reduce the number of calls by caching intermediate results or refactoring the code to call the function less frequently."
-    },
-    "line_optimization": {
-        "description": "Lines with high execution time or a large number of hits should be carefully examined. Look for inefficient algorithms or redundant operations.",
-        "check": lambda line_stats: line_stats["percent_time"] > 50 or line_stats["hits"] > 100,
-        "suggestion": "Analyze the code on this line to find inefficient algorithms or redundant operations. You may need to rewrite the code using more efficient data structures or algorithms. For example, if you are using a slow search algorithm, consider using a faster one like binary search if applicable."
-    },
-    "memory_optimization": {
-        "description": "Functions with high memory usage may need optimization. Check for large data structures or memory leaks.",
-        "check": lambda mem_stats: mem_stats["memory_usage"] > 100,
-        "suggestion": "Review the function to identify large data structures that can be optimized. You can try to reduce the size of these data structures or release memory more quickly. Also, check for memory leaks by ensuring that all resources are properly released after use."
-    }
-}
+class RuleManager:
+    def __init__(self):
+        """Initialize the rule manager with default rules."""
+        self.rules = {
+            "loop_optimization": {
+                "description": "Optimize loops to reduce unnecessary iterations.",
+                "check": lambda node: isinstance(node, ast.For) and isinstance(node.iter, ast.Call) and node.iter.func.id == 'range' and len(node.iter.args) > 1 and node.iter.args[0].n == 0 and node.iter.args[1].n == 1,
+                "suggestion": "Remove the unnecessary range with start 0 and stop 1.",
+                "is_ast_based": True
+            },
+            "cache_suggestion": {
+                "description": "Cache function results if the same function is called multiple times with the same arguments.",
+                "check": lambda node: isinstance(node, ast.Call) and isinstance(node.func, ast.Name),
+                "suggestion": "Consider using functools.lru_cache to cache the function results.",
+                "is_ast_based": True
+            },
+            "function_call_optimization": {
+                "description": "Optimize function calls to reduce overhead.",
+                "check": lambda stats: stats.get("calls", 0) > 3,
+                "suggestion": "Consider optimizing the function or reducing the number of calls.",
+                "is_ast_based": False
+            }
+        }
+    
+    def add_rule(self, 
+                rule_name: str, 
+                description: str,
+                check_func: Callable[[Any], bool],
+                suggestion: str,
+                is_ast_based: bool = True):
+        """
+        Add a new rule (replaces if exists).
+        """
+        self.rules[rule_name] = {
+            "description": description,
+            "check": check_func,
+            "suggestion": suggestion,
+            "is_ast_based": is_ast_based
+        }
+    
+    def remove_rule(self, rule_name: str):
+        """Remove a rule."""
+        if rule_name in self.rules:
+            del self.rules[rule_name]
+    
+    def get_all_rules(self) -> Dict[str, Any]:
+        """Get all rules."""
+        return self.rules.copy()
+
+    def get_ast_rules(self) -> Dict[str, Any]:
+        """Get AST-based rules."""
+        return {k: v for k, v in self.rules.items() if v.get('is_ast_based', True)}
+
+    def get_non_ast_rules(self) -> Dict[str, Any]:
+        """Get non-AST-based rules."""
+        return {k: v for k, v in self.rules.items() if not v.get('is_ast_based', True)}
+
+class CustomRuleBuilder:
+    @staticmethod
+    def build_ast_rule(check_condition: str, 
+                      description: str, 
+                      suggestion: str,
+                      node_type: str = None):
+        """
+        Build an AST node check rule from a string condition.
+        """
+        def checker(node):
+            if node_type and not isinstance(node, getattr(ast, node_type, None)):
+                return False
+            return eval(check_condition, {'node': node, 'ast': ast})
+        
+        checker.original_condition = check_condition
+        
+        return {
+            "description": description,
+            "check": checker,
+            "suggestion": suggestion,
+            "is_ast_based": True
+        }
+
+    @staticmethod
+    def build_non_ast_rule(check_condition: str,
+                        description: str,
+                        suggestion: str):
+        """
+        Build a non-AST rule from a string condition.
+        """
+        try:
+            # Directly compile the condition into a lambda function
+            def checker(stats):
+                return eval(check_condition, {'stats': stats})
+        
+            checker.original_condition = check_condition
+
+            return {
+                "description": description,
+                "check": checker,
+                "suggestion": suggestion,
+                "is_ast_based": False
+            }
+        except Exception as e:
+            raise ValueError(f"Invalid check condition: {str(e)}")
 
 
 class ASTVisitor(ast.NodeVisitor):
-    def __init__(self):
+    def __init__(self, rule_manager: RuleManager):
         self.suggestions = []
-        self.parent = None
+        self.current_function = None
+        self.rule_manager = rule_manager
+
+    def visit_FunctionDef(self, node):
+        old_function = self.current_function
+        self.current_function = node.name
+        self.generic_visit(node)
+        self.current_function = old_function
 
     def generic_visit(self, node):
-        # Set the parent node of the current node
-        old_parent = self.parent
-        self.parent = node
-        for rule_name, rule in OPTIMIZATION_RULES.items():
-            if rule_name in ["loop_optimization", "redundant_calculation", "cache_suggestion"] and rule["check"](node):
-                self.suggestions.append({
-                    "rule": rule_name,
-                    "description": rule["description"],
-                    "suggestion": rule["suggestion"],
-                    "line": node.lineno if hasattr(node, 'lineno') else None
-                })
+        for rule_name, rule in self.rule_manager.get_ast_rules().items():
+            try:
+                if rule["check"](node):
+                    suggestion = {
+                        "rule": rule_name,
+                        "description": rule["description"],
+                        "suggestion": rule["suggestion"],
+                        "line": node.lineno if hasattr(node, 'lineno') else None
+                    }
+                    if self.current_function:
+                        suggestion["function"] = self.current_function
+                    self.suggestions.append(suggestion)
+            except Exception as e:
+                print(f"Error applying rule {rule_name}: {e}")
+        
         super().generic_visit(node)
-        self.parent = old_parent
 
-
-def generate_optimization_suggestions(code: str, analysis_results: Dict[str, Any]) -> List[Dict[str, Any]]:
+def generate_optimization_suggestions(
+        code: str, 
+        analysis_results: List[Dict[str, Any]],
+        rule_manager: Optional[RuleManager] = None
+    ) -> List[Dict[str, Any]]:
     """
-    Generate optimization suggestions
-    :param code: The Python code to be analyzed
-    :param analysis_results: Performance analysis results generated by the first set of code
-    :return: List of optimization suggestions
+    Generate optimization suggestions for the given code and analysis results.
     """
+    if rule_manager is None:
+        rule_manager = RuleManager()
+    
     suggestions = []
+    
+    # AST Analysis
     try:
-        # AST analysis
         tree = ast.parse(code)
-        visitor = ASTVisitor()
+        visitor = ASTVisitor(rule_manager)
         visitor.visit(tree)
         suggestions.extend(visitor.suggestions)
-
-        # Generate suggestions based on function-level analysis results
-        if "function" in analysis_results:
-            func_results = analysis_results["function"]["results"]
-            for func_stats in func_results:
-                for rule_name, rule in OPTIMIZATION_RULES.items():
-                    if rule_name == "function_call_optimization" and rule["check"](func_stats):
-                        suggestions.append({
-                            "rule": rule_name,
-                            "description": rule["description"],
-                            "suggestion": rule["suggestion"],
-                            "function": func_stats["function"],
-                            "line": func_stats["line_number"]
-                        })
-
-        # Generate suggestions based on line-by-line analysis results
-        if "line" in analysis_results:
-            line_results = analysis_results["line"]["results"]
-            for line_stats in line_results:
-                for rule_name, rule in OPTIMIZATION_RULES.items():
-                    if rule_name == "line_optimization" and rule["check"](line_stats):
-                        suggestions.append({
-                            "rule": rule_name,
-                            "description": rule["description"],
-                            "suggestion": rule["suggestion"],
-                            "line": line_stats["line_number"],
-                            "function": line_stats["function"]
-                        })
-
-        # Generate suggestions based on memory analysis results
-        if "memory" in analysis_results:
-            mem_results = analysis_results["memory"]["results"]
-            for mem_stats in mem_results:
-                for rule_name, rule in OPTIMIZATION_RULES.items():
-                    if rule_name == "memory_optimization" and rule["check"](mem_stats):
-                        suggestions.append({
-                            "rule": rule_name,
-                            "description": rule["description"],
-                            "suggestion": rule["suggestion"],
-                            "function": mem_stats["function"]
-                        })
-
     except SyntaxError as e:
         print(f"Syntax error in code: {e}")
+
+    # Performance/Memory Analysis
+    for result in analysis_results:
+        mode = result.get("mode")
+        if mode == "function":
+            for func_stats in result["results"]:
+                for rule_name, rule in rule_manager.get_non_ast_rules().items():
+                    try:
+                        if rule["check"](func_stats):
+                            suggestions.append({
+                                "rule": rule_name,
+                                "description": rule["description"],
+                                "suggestion": rule["suggestion"],
+                                "function": func_stats["function"],
+                                "line": func_stats.get("line_number")
+                            })
+                    except Exception as e:
+                        print(f"Error applying rule {rule_name}: {e}")
+                        
+        elif mode == "line":
+            for line_stats in result["results"]:
+                for rule_name, rule in rule_manager.get_non_ast_rules().items():
+                    try:
+                        if rule["check"](line_stats):
+                            suggestions.append({
+                                "rule": rule_name,
+                                "description": rule["description"],
+                                "suggestion": rule["suggestion"],
+                                "function": line_stats["function"],
+                                "line": line_stats["line_number"]
+                            })
+                    except Exception as e:
+                        print(f"Error applying rule {rule_name}: {e}")
+                        
+        elif mode == "memory":
+            for mem_stats in result["results"]:
+                for mem_usage in mem_stats.get("memory_usage", []):
+                    for rule_name, rule in rule_manager.get_non_ast_rules().items():
+                        try:
+                            if rule["check"](mem_usage):
+                                suggestions.append({
+                                    "rule": rule_name,
+                                    "description": rule["description"],
+                                    "suggestion": rule["suggestion"],
+                                    "function": mem_stats["function"],
+                                    "line": int(mem_usage.get("Line", 0))
+                                })
+                        except Exception as e:
+                            print(f"Error applying rule {rule_name}: {e}")
+
     return suggestions

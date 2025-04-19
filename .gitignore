@@ -170,3 +170,4 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 .idea
+.vscode/c_cpp_properties.json

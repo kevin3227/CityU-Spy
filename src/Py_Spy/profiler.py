@@ -19,8 +19,32 @@ import os
 
 from typing import Dict, List, Any, Optional
 
+# def precise_sleep(interval):
+#     start = time.perf_counter()
+#     while True:
+#         elapsed = time.perf_counter() - start
+#         remaining = interval - elapsed
+#         if remaining <= 0:
+#             break
+#         time.sleep(remaining * 0.5)
+
+import ctypes
+
+class Timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+libc = ctypes.CDLL("libc.so.6")
+libc.nanosleep.argtypes = [ctypes.POINTER(Timespec), ctypes.POINTER(Timespec)]
+
+def nanosleep(ns):
+    req = Timespec()
+    req.tv_sec = ns // 1_000_000_000
+    req.tv_nsec = ns % 1_000_000_000
+    rem = Timespec()
+    libc.nanosleep(req, rem)
+
 class ThreadSampler:
-    def __init__(self, interval=1e-5, fine_grained=False):
+    def __init__(self, interval=1e-3, fine_grained=False):
         self.interval = interval  # Sampling interval (seconds)
         self.running = False      # Flag to control the sampling thread's state
         self.samples = []         # List of collected samples
@@ -92,6 +116,8 @@ class ThreadSampler:
                 
                 self.samples.extend(sample)
                 time.sleep(self.interval)  # Wait for the sampling interval
+                # precise_sleep(self.interval)  # Use precise sleep to reduce timing errors
+                # nanosleep(int(self.interval * 1_000_000_000))  # Use nanosleep for better precision
 
     def start(self):
         """Start sampling thread or settrace"""
@@ -320,7 +346,8 @@ class PerformanceAnalyzer:
                     "function": func_stat.full_name.split(" ")[-1],
                     "calls": func_stat.ncall,
                     "total_time": func_stat.ttot,
-                    "average_time": func_stat.ttot / func_stat.ncall if func_stat.ncall > 0 else 0
+                    "average_time": func_stat.ttot / func_stat.ncall if func_stat.ncall > 0 else 0,
+                    "line_number": func_stat.lineno
                     # "sub_calls": [(sub_call.full_name, sub_call.ncall, sub_call.ttot) for sub_call in func_stat.children]
                 })
 
@@ -464,10 +491,10 @@ class PerformanceAnalyzer:
                         
                         results.append({
                             "line_number": line_num,
-                            "hits": hits,
-                            "total_time": time,
-                            "per_hit": per_hit,
-                            "percent_time": percent,
+                            # "hits": hits,
+                            # "total_time": time,
+                            "time": per_hit,
+                            "percent": percent,
                             "code": code,
                             "function": current_function
                         })
@@ -625,12 +652,12 @@ class PerformanceAnalyzer:
 
 # Test code
 if __name__ == "__main__":
-    # mthread = False
-    mthread = True
+    mthread = False
+    # mthread = True
     analyzer = PerformanceAnalyzer(mthread, fine_grained=True)
-    if mthread:
-        result = analyzer.analyze_file("../../data/sample_code/multi.py", "function")
-    else:
-        result = analyzer.analyze_file("../../data/sample_code/example2.py", "function")
-    # result = analyzer.analyze_file("../../data/sample_code/example2.py", "memory")
+    # if mthread:
+    #     result = analyzer.analyze_file("../../data/sample_code/multi.py", "function")
+    # else:
+    #     result = analyzer.analyze_file("../../data/sample_code/example2.py", "function")
+    result = analyzer.analyze_file("../../data/sample_code/example2.py", "memory")
     print(json.dumps(result, indent=4))

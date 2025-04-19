@@ -1,7 +1,7 @@
 import threading
 import time
 
-def worker(num):
+def worker(num=1):
     for _ in range(3):
         print(f"Thread {num}: Working...")
         time.sleep(0.1)
