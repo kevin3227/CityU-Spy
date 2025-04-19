@@ -243,8 +243,8 @@ class TestAnalyzeFunctionLevel:
         expected_calls = [
             call("\nCall Tree:"),
             call("=========="),
-            call("parent_func"),
-            call("  └── child_func")
+            call("parent_func (calls: 2, time: 0.400000s)"),
+            call("  └── child_func (calls: 1, time: 0.200000s)")
         ]
         mock_print.assert_has_calls(expected_calls, any_order=False)
 
