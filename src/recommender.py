@@ -1,7 +1,10 @@
 import ast
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Union, Optional
+import json
+import os
+from pathlib import Path
 
-# Optimization Rules Library
+# Optimization Rules Library (Sprint 2 + Sprint 3)
 OPTIMIZATION_RULES = {
     "loop_optimization": {
         "description": "Optimize loops to reduce unnecessary iterations.",
@@ -30,7 +33,6 @@ OPTIMIZATION_RULES = {
     },
     "memory_optimization": {
         "description": "Optimize memory usage in functions.",
-        # Modified here to add checks for empty strings
         "check": lambda stats: float(stats.get("Mem usage", "0").split()[0]) if stats.get("Mem usage", "0").strip() else 0 > 48,
         "suggestion": "Review and optimize memory usage in this function."
     },
@@ -43,6 +45,16 @@ OPTIMIZATION_RULES = {
         "description": "When a dictionary has consecutive integer keys starting from 0, consider using a list for better access performance.",
         "check": lambda node: isinstance(node, ast.Dict) and all(isinstance(key, ast.Num) for key in node.keys) and sorted([key.n for key in node.keys]) == list(range(len(node.keys))),
         "suggestion": "Convert the dictionary to a list."
+    },
+    "delayed_import_optimization": {  # Sprint 3新增规则
+        "description": "Optimize delayed imports to improve startup performance.",
+        "check": lambda node: isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom),
+        "suggestion": "Consider moving imports inside functions if they're not needed at startup."
+    },
+    "exception_handling_optimization": {  # Sprint 3新增规则
+        "description": "Optimize exception handling to avoid performance penalties.",
+        "check": lambda node: isinstance(node, ast.Try) and len(node.handlers) > 0,
+        "suggestion": "Avoid broad exception handling; use specific exceptions where possible."
     }
 }
 
@@ -62,7 +74,7 @@ class ASTVisitor(ast.NodeVisitor):
         old_parent = self.parent
         self.parent = node
         for rule_name, rule in OPTIMIZATION_RULES.items():
-            if rule_name in ["loop_optimization", "redundant_calculation", "cache_suggestion", "list_to_generator", "dict_optimization"]:
+            if rule_name in ["loop_optimization", "redundant_calculation", "cache_suggestion", "list_to_generator", "dict_optimization", "delayed_import_optimization", "exception_handling_optimization"]:
                 if rule["check"](node):
                     suggestion = {
                         "rule": rule_name,
@@ -76,8 +88,44 @@ class ASTVisitor(ast.NodeVisitor):
         super().generic_visit(node)
         self.parent = old_parent
 
-def generate_optimization_suggestions(code: str, analysis_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def load_custom_rules(custom_rules_path: str) -> Dict:
+    """Sprint 3新增：加载用户自定义规则"""
+    if not os.path.exists(custom_rules_path):
+        return {}
+    
+    with open(custom_rules_path, 'r') as f:
+        custom_rules = json.load(f)
+    
+    # 验证规则格式
+    validated_rules = {}
+    for rule_name, rule in custom_rules.items():
+        if "description" in rule and "check" in rule and "suggestion" in rule:
+            try:
+                # 将字符串形式的检查函数转换为lambda表达式
+                check_func = eval(f"lambda node: {rule['check']}")
+                validated_rules[rule_name] = {
+                    "description": rule["description"],
+                    "check": check_func,
+                    "suggestion": rule["suggestion"]
+                }
+            except:
+                print(f"Warning: Invalid check function for custom rule '{rule_name}'")
+    
+    return validated_rules
+
+def generate_optimization_suggestions(
+    code: str, 
+    analysis_results: List[Dict[str, Any]],
+    custom_rules_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Sprint 3增强：支持用户自定义规则和更详细的建议输出"""
     suggestions = []
+    
+    # 加载用户自定义规则
+    custom_rules = {}
+    if custom_rules_path:
+        custom_rules = load_custom_rules(custom_rules_path)
+    
     try:
         # AST Analysis
         tree = ast.parse(code)
@@ -90,48 +138,95 @@ def generate_optimization_suggestions(code: str, analysis_results: List[Dict[str
             if mode == "function":
                 func_results = result["results"]
                 for func_stats in func_results:
-                    for rule_name, rule in OPTIMIZATION_RULES.items():
+                    for rule_name, rule in {**OPTIMIZATION_RULES, **custom_rules}.items():
                         if rule_name == "function_call_optimization" and rule["check"](func_stats):
                             suggestions.append({
                                 "rule": rule_name,
                                 "description": rule["description"],
                                 "suggestion": rule["suggestion"],
                                 "function": func_stats["function"],
-                                "line": func_stats["line_number"]
+                                "line": func_stats["line_number"],
+                                "details": {
+                                    "total_time": func_stats["total_time"],
+                                    "calls": func_stats["calls"],
+                                    "average_time": func_stats["average_time"]
+                                }
                             })
             elif mode == "line":
                 line_results = result["results"]
                 for line_stats in line_results:
-                    for rule_name, rule in OPTIMIZATION_RULES.items():
+                    for rule_name, rule in {**OPTIMIZATION_RULES, **custom_rules}.items():
                         if rule_name == "line_optimization" and rule["check"](line_stats):
                             suggestions.append({
                                 "rule": rule_name,
                                 "description": rule["description"],
                                 "suggestion": rule["suggestion"],
                                 "function": line_stats["function"],
-                                "line": line_stats["line_number"]
+                                "line": line_stats["line_number"],
+                                "details": {
+                                    "total_time": line_stats["total_time"],
+                                    "percent_time": line_stats["percent_time"],
+                                    "code": line_stats["code"]
+                                }
                             })
             elif mode == "memory":
                 mem_results = result["results"]
                 for mem_stats in mem_results:
                     for mem_usage in mem_stats["memory_usage"]:
-                        for rule_name, rule in OPTIMIZATION_RULES.items():
+                        for rule_name, rule in {**OPTIMIZATION_RULES, **custom_rules}.items():
                             if rule_name == "memory_optimization" and rule["check"](mem_usage):
                                 suggestions.append({
                                     "rule": rule_name,
                                     "description": rule["description"],
                                     "suggestion": rule["suggestion"],
                                     "function": mem_stats["function"],
-                                    "line": int(mem_usage["Line"])
+                                    "line": int(mem_usage["Line"]),
+                                    "details": {
+                                        "memory_usage": mem_usage["Mem usage"],
+                                        "increment": mem_usage["Increment"],
+                                        "line_contents": mem_usage["Line Contents"]
+                                    }
                                 })
 
     except SyntaxError as e:
         print(f"Syntax error in code: {e}")
+    
+    # 按严重程度排序建议
+    suggestions.sort(key=lambda x: x.get("details", {}).get("total_time", 0), reverse=True)
     return suggestions
+
+def format_suggestions(suggestions: List[Dict[str, Any]]) -> str:
+    """Sprint 3新增：格式化优化建议为可读报告"""
+    report = "Optimization Suggestions Report\n"
+    report += "=" * 50 + "\n\n"
+    
+    for idx, suggestion in enumerate(suggestions, 1):
+        report += f"Suggestion #{idx}\n"
+        report += "-" * 50 + "\n"
+        report += f"Rule: {suggestion['rule']}\n"
+        report += f"Description: {suggestion['description']}\n"
+        report += f"Suggestion: {suggestion['suggestion']}\n"
+        
+        if "function" in suggestion:
+            report += f"Function: {suggestion['function']}\n"
+        
+        if "line" in suggestion:
+            report += f"Line: {suggestion['line']}\n"
+        
+        if "details" in suggestion:
+            report += "\nDetails:\n"
+            for key, value in suggestion["details"].items():
+                report += f"  {key}: {value}\n"
+        
+        report += "\n"
+    
+    return report
 
 # Test code
 if __name__ == "__main__":
     code = """
+import time
+
 def process_data():
     data = [x * 2 for x in range(100000)]
     return sum(data)
@@ -301,7 +396,7 @@ call_process_data_1()
                             "Mem usage": "47.4 MiB",
                             "Increment": "47.4 MiB",
                             "Occurrences": "1",
-                            "Line Contents": "def call_process_data_0():"
+                            "Line Contents": "def call_process_data_0():" 
                         },
                         {
                             "Line": "9",
@@ -327,7 +422,7 @@ call_process_data_1()
                             "Mem usage": "47.7 MiB",
                             "Increment": "47.7 MiB",
                             "Occurrences": "1",
-                            "Line Contents": "def call_process_data_1():"
+                            "Line Contents": "def call_process_data_1():" 
                         },
                         {
                             "Line": "13",
@@ -353,7 +448,7 @@ call_process_data_1()
                             "Mem usage": "47.7 MiB",
                             "Increment": "47.7 MiB",
                             "Occurrences": "1",
-                            "Line Contents": "def process_data():"
+                            "Line Contents": "def process_data():" 
                         },
                         {
                             "Line": "4",
@@ -382,6 +477,17 @@ call_process_data_1()
         }
     ]
 
-    suggestions = generate_optimization_suggestions(code, analysis_results)
-    for suggestion in suggestions:
-        print(suggestion)
+    # 示例：使用自定义规则文件
+    custom_rules_path = "custom_rules.json"
+    with open(custom_rules_path, 'w') as f:
+        json.dump({
+            "custom_rule_1": {
+                "description": "Custom rule for detecting unused imports",
+                "check": "isinstance(node, ast.Import) and len(node.names) > 0",
+                "suggestion": "Consider removing unused imports to clean up the code."
+            }
+        }, f)
+    
+    suggestions = generate_optimization_suggestions(code, analysis_results, custom_rules_path)
+    report = format_suggestions(suggestions)
+    print(report)
